@@ -1,14 +1,25 @@
 // ==========================================
-// MCU 0 - MAIN CONTROLLER SKETCH
+// MCU 0 - MASTER HUB & FLEET ORCHESTRATOR
 // ==========================================
-#include <Arduino.h>
-#include <esp_now.h>
-#include <WiFi.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include 
+#include 
+#include 
+#include 
+#include 
 #include "espnow_protocol.h"
 
+// ==========================================
+// 1. HARDWARE & PEER CONFIGURATION
+// ==========================================
 LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Explicit MAC Address Mapping for Worker Nodes (Index 0 = Unused/Broadcast)
+static const uint8_t STATION_MACS[4][6] = {
+  {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 
+  {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0x01}, // MCU 1 (Wind)  - Replace with actual MAC
+  {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0x02}, // MCU 2 (Solar) - Replace with actual MAC
+  {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0x03}  // MCU 3 (Hydro) - Replace with actual MAC
+};
 
 struct StationRecord {
   StationTelemetryPayload telemetry;
@@ -21,12 +32,24 @@ struct StationRecord {
 StationRecord stationRegistry[4];
 const unsigned long HEARTBEAT_TIMEOUT = 6000;
 
+// LCD & UI State
 uint8_t currentViewMode = 0; // 0 = Overview, 1..3 = Station Detail Views
 unsigned long lastLcdRefresh = 0;
 const unsigned long LCD_REFRESH_INTERVAL = 300;
+bool lcdNeedsClear = false;
+
+// Non-Blocking Automated Sequence State Machine
+enum SystemRunMode { MODE_NORMAL, MODE_TEST_SEQUENCE, MODE_DEMO_SEQUENCE };
+SystemRunMode currentRunMode = MODE_NORMAL;
+uint8_t sequenceStep = 0;
+unsigned long sequenceTimer = 0;
+
+// Serial CLI Input Buffer
+char cliInputBuffer[128];
+uint8_t cliBufferIndex = 0;
 
 // ==========================================
-// DISPLAY ENGINE
+// 2. DISPLAY ENGINE
 // ==========================================
 
 void printHelpMenu() {
@@ -39,14 +62,18 @@ void printHelpMenu() {
   Serial.println(F("   status / s  : Print detailed telemetry matrix to Serial"));
   Serial.println(F("   help / ?    : Display command menu\n"));
   Serial.println(F(" EMERGENCY & POWER:"));
-  Serial.println(F("   estop / e   : EMERGENCY STOP ALL STATIONS (e1, e2, e3 for single)"));
+  Serial.println(F("   estop / e   : Emergency stop target (e.g. 'e', 'e0', 'e1')"));
+  Serial.println(F("   shutdown    : MASTER SHUTDOWN (Immediate network-wide halt)"));
   Serial.println(F("   pall / p0   : Put ALL stations to Sleep (p1, p2, p3 for single)"));
   Serial.println(F("   w0..w3      : Wake up ALL (w0) or target station (w1, w2, w3)\n"));
-  Serial.println(F(" DIAGNOSTICS & HARDWARE CONTROL:"));
-  Serial.println(F("   tall / t0   : Trigger sequential diagnostic test (t1, t2, t3 for single)"));
-  Serial.println(F("   act <id> <1|0>   : Remote toggle station actuator (e.g. 'act 1 1')"));
-  Serial.println(F("   cfg <id> <ms>    : Set remote telemetry interval (e.g. 'cfg 2 1000')"));
-  Serial.println(F("   boot <id>        : Force remote station reboot (e.g. 'boot 3')"));
+  Serial.println(F(" EXECUTIVE & ADVANCED CONTROL:"));
+  Serial.println(F("   speed <0-100>   : Set global fleet production output speed %"));
+  Serial.println(F("   banner    : Broadcast custom 20-char message to LCDs"));
+  Serial.println(F("   demo            : Launch non-blocking 30-second automated demo"));
+  Serial.println(F("   tall / t0       : Launch non-blocking diagnostic sweep"));
+  Serial.println(F("   act  <1|0>  : Toggle station actuator directly"));
+  Serial.println(F("   cfg     : Set remote telemetry report interval"));
+  Serial.println(F("   boot        : Force remote station reboot"));
   Serial.println(F("==================================================================\n"));
 }
 
@@ -81,7 +108,7 @@ void renderStationDetailLCD(uint8_t stationId) {
   // Line 1: Mode state
   if (!stn.isOnline) {
     writeLcdLine(1, "MODE: UNREACHABLE   ");
-  } else if (stn.telemetry.status == CMD_EMERGENCY_STOP) {
+  } else if (stn.telemetry.status == CMD_EMERGENCY_STOP || stn.telemetry.status == CMD_MASTER_SHUTDOWN) {
     writeLcdLine(1, "MODE: EMERGENCY STOP");
   } else if (stn.telemetry.status == CMD_POWER_SAVE) {
     writeLcdLine(1, "MODE: POWER SAVE    ");
@@ -91,7 +118,7 @@ void renderStationDetailLCD(uint8_t stationId) {
     writeLcdLine(1, "MODE: ACTIVE RUN    ");
   }
 
-  // Line 2: Sensor Metric + Car Presence (BUG FIXED: Outputted to Line 2)
+  // Line 2: Sensor Metric + Car Presence
   if (stn.isOnline) {
     const char* unit = (stationId == 1) ? "RPM" : (stationId == 2) ? "W" : "L/m";
     snprintf(lineBuf, sizeof(lineBuf), "CAR:%-3s|%5.1f%-3s ON:%s", 
@@ -113,6 +140,10 @@ void renderStationDetailLCD(uint8_t stationId) {
 }
 
 void updateLcdDisplay() {
+  if (lcdNeedsClear) {
+    lcd.clear();
+    lcdNeedsClear = false;
+  }
   if (currentViewMode == 0) {
     renderOverviewLCD();
   } else {
@@ -123,7 +154,7 @@ void updateLcdDisplay() {
 void selectDisplayView(uint8_t viewMode) {
   if (viewMode <= 3 && viewMode != currentViewMode) {
     currentViewMode = viewMode;
-    lcd.clear(); // Prevents layout ghosting across view changes
+    lcdNeedsClear = true;
     updateLcdDisplay();
     Serial.printf("[LCD] View mode set to: %d\n", viewMode);
   }
@@ -136,8 +167,40 @@ void cycleDisplayView() {
 }
 
 // ==========================================
-// ESP-NOW PIPELINE & ACK HANDSHAKE
+// 3. ESP-NOW TRANSMISSION & PIPELINE
 // ==========================================
+
+void sendCommand(uint8_t target_id, CommandType cmd, uint16_t param = 0, uint16_t extra = 0) {
+  ControllerCommandPayload cmdPacket;
+  cmdPacket.packet_type = PKT_CMD;
+  cmdPacket.target_station_id = target_id;
+  cmdPacket.command = (uint8_t)cmd;
+  cmdPacket.parameter = param;
+  cmdPacket.extra_param = extra;
+
+  if (target_id == 0) {
+    for (int i = 1; i <= 3; i++) {
+      esp_now_send(STATION_MACS[i], (uint8_t *)&cmdPacket, sizeof(cmdPacket));
+    }
+    Serial.printf("[NOW TX] Broadcast Command 0x%02X sent to ALL stations.\n", cmd);
+  } else if (target_id >= 1 && target_id <= 3) {
+    esp_now_send(STATION_MACS[target_id], (uint8_t *)&cmdPacket, sizeof(cmdPacket));
+    Serial.printf("[NOW TX] Command 0x%02X sent to Station %d (Param: %d)\n", cmd, target_id, param);
+  }
+}
+
+void sendBroadcastBanner(const char* message) {
+  CustomBannerPayload bannerPacket;
+  bannerPacket.packet_type = PKT_BANNER;
+  bannerPacket.target_station_id = 0; // Broadcast
+  bannerPacket.command = (uint8_t)CMD_BROADCAST_BANNER;
+  snprintf(bannerPacket.banner_text, sizeof(bannerPacket.banner_text), "%-20s", message);
+
+  for (int i = 1; i <= 3; i++) {
+    esp_now_send(STATION_MACS[i], (uint8_t *)&bannerPacket, sizeof(bannerPacket));
+  }
+  Serial.printf("[NOW TX] Banner Broadcast Sent: '%s'\n", bannerPacket.banner_text);
+}
 
 void processIncomingTelemetry(const StationTelemetryPayload &incoming) {
   uint8_t id = incoming.station_id;
@@ -156,52 +219,6 @@ void updateStationHealth() {
       stationRegistry[i].telemetry.status = 0;
       Serial.printf("[WARN] Connection lost to Station %d\n", i);
     }
-  }
-}
-
-void sendCommand(uint8_t target_id, CommandType cmd, uint16_t param = 0, float extra = 0.0f) {
-  ControllerCommandPayload cmdPacket;
-  cmdPacket.target_station_id = target_id;
-  cmdPacket.command = (uint8_t)cmd;
-  cmdPacket.parameter = param;
-  cmdPacket.extra_param = extra;
-
-  if (target_id == 0) {
-    for (int i = 1; i <= 3; i++) {
-      esp_now_send(STATION_MACS[i], (uint8_t *)&cmdPacket, sizeof(cmdPacket));
-    }
-    Serial.printf("[NOW TX] Broadcast Command 0x%02X sent to ALL stations.\n", cmd);
-  } else if (target_id >= 1 && target_id <= 3) {
-    esp_now_send(STATION_MACS[target_id], (uint8_t *)&cmdPacket, sizeof(cmdPacket));
-    Serial.printf("[NOW TX] Command 0x%02X sent to Station %d (Param: %d)\n", cmd, target_id, param);
-  }
-}
-
-void handleTestCommand(uint8_t targetId) {
-  if (targetId >= 1 && targetId <= 3) {
-    selectDisplayView(targetId);
-    sendCommand(targetId, CMD_RUN_TEST);
-  } 
-  else if (targetId == 0) {
-    Serial.println(F("\n[TEST MASTER] Initiating Global Sequential System Test (Stations 1 -> 3)..."));
-
-    for (uint8_t id = 1; id <= 3; id++) {
-      selectDisplayView(id);
-      sendCommand(id, CMD_RUN_TEST);
-
-      unsigned long testStart = millis();
-      while (millis() - testStart < 6500) {
-        updateStationHealth();
-        if (millis() - lastLcdRefresh >= LCD_REFRESH_INTERVAL) {
-          lastLcdRefresh = millis();
-          updateLcdDisplay();
-        }
-        delay(10);
-      }
-    }
-
-    Serial.println(F("[TEST MASTER] Global Sequential Test Complete.\n"));
-    selectDisplayView(0);
   }
 }
 
@@ -228,11 +245,81 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {}
 
 // ==========================================
-// SERIAL COMMAND INTERACTION (CLI)
+// 4. NON-BLOCKING AUTOMATED SEQUENCES
+// ==========================================
+
+void startTestSequence(uint8_t targetId) {
+  if (targetId >= 1 && targetId <= 3) {
+    selectDisplayView(targetId);
+    sendCommand(targetId, CMD_RUN_TEST);
+  } else {
+    Serial.println(F("[SEQ] Starting Non-Blocking System Diagnostic Sweep..."));
+    currentRunMode = MODE_TEST_SEQUENCE;
+    sequenceStep = 1;
+    sequenceTimer = millis();
+    selectDisplayView(1);
+    sendCommand(1, CMD_RUN_TEST);
+  }
+}
+
+void startDemoShowcase() {
+  Serial.println(F("[DEMO] Launching Automated Microgrid Demo Showcase..."));
+  currentRunMode = MODE_DEMO_SEQUENCE;
+  sequenceStep = 1;
+  sequenceTimer = millis();
+  sendBroadcastBanner("DEMO MODE ACTIVE");
+  sendCommand(0, CMD_SET_FLEET_SPEED, 80); // 80% Output
+}
+
+void processSequenceEngine() {
+  if (currentRunMode == MODE_NORMAL) return;
+
+  unsigned long now = millis();
+
+  // Mode 1: Non-Blocking Diagnostic Sweep
+  if (currentRunMode == MODE_TEST_SEQUENCE) {
+    if (now - sequenceTimer >= 5000) { // 5 seconds per node
+      sequenceTimer = now;
+      sequenceStep++;
+      if (sequenceStep <= 3) {
+        selectDisplayView(sequenceStep);
+        sendCommand(sequenceStep, CMD_RUN_TEST);
+      } else {
+        Serial.println(F("[SEQ] Diagnostic Sweep Complete. Returning to Overview."));
+        currentRunMode = MODE_NORMAL;
+        selectDisplayView(0);
+      }
+    }
+  }
+  // Mode 2: Automated Demo Showcase
+  else if (currentRunMode == MODE_DEMO_SEQUENCE) {
+    if (now - sequenceTimer >= 8000) { // 8 seconds per step
+      sequenceTimer = now;
+      sequenceStep++;
+      if (sequenceStep == 2) {
+        selectDisplayView(1); // Focus Wind
+        sendCommand(1, CMD_ACTUATOR_CTRL, 1);
+      } else if (sequenceStep == 3) {
+        selectDisplayView(2); // Focus Solar
+        sendCommand(2, CMD_ACTUATOR_CTRL, 1);
+      } else if (sequenceStep == 4) {
+        selectDisplayView(3); // Focus Hydro
+        sendCommand(3, CMD_ACTUATOR_CTRL, 1);
+      } else {
+        Serial.println(F("[DEMO] Showcase Completed. Resetting to Normal Mode."));
+        currentRunMode = MODE_NORMAL;
+        sendCommand(0, CMD_ACTUATOR_CTRL, 0);
+        selectDisplayView(0);
+      }
+    }
+  }
+}
+
+// ==========================================
+// 5. SERIAL COMMAND PARSER (C-STRING CLI)
 // ==========================================
 
 void printSystemStatusTable() {
-  unsigned long now = millis();
   Serial.println(F("\n========================================================================================"));
   Serial.println(F("                                MCU 0 TELEMETRY MATRIX                                  "));
   Serial.println(F("========================================================================================"));
@@ -246,7 +333,7 @@ void printSystemStatusTable() {
 
     const char* statusStr = "UNREACH   ";
     if (stn.isOnline) {
-      if (stn.telemetry.status == CMD_EMERGENCY_STOP) statusStr = "E-STOP    ";
+      if (stn.telemetry.status == CMD_EMERGENCY_STOP || stn.telemetry.status == CMD_MASTER_SHUTDOWN) statusStr = "E-STOP    ";
       else if (stn.telemetry.status == CMD_RUN_TEST)   statusStr = "DIAGNOSTIC";
       else if (stn.telemetry.status == CMD_POWER_SAVE) statusStr = "POWER SAVE";
       else                                              statusStr = "ACTIVE RUN";
@@ -277,62 +364,97 @@ void printSystemStatusTable() {
   Serial.println(F("========================================================================================\n"));
 }
 
-void handleSerialCommands() {
-  if (!Serial.available()) return;
+void parseAndExecuteCLI(char* line) {
+  // Navigation & Shortcuts
+  if (strcmp(line, "n") == 0 || strcmp(line, "next") == 0) { cycleDisplayView(); return; }
+  if (strcmp(line, "v0") == 0) { selectDisplayView(0); return; }
+  if (strcmp(line, "v1") == 0) { selectDisplayView(1); return; }
+  if (strcmp(line, "v2") == 0) { selectDisplayView(2); return; }
+  if (strcmp(line, "v3") == 0) { selectDisplayView(3); return; }
+  if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) { printHelpMenu(); return; }
+  if (strcmp(line, "status") == 0 || strcmp(line, "s") == 0) { printSystemStatusTable(); return; }
 
-  String input = Serial.readStringUntil('\n');
-  input.trim();
-  if (input.length() == 0) return;
-
-  // Shortcuts & Direct Actions
-  if (input == "n" || input == "next") { cycleDisplayView(); return; }
-  if (input == "v0") { selectDisplayView(0); return; }
-  if (input == "v1") { selectDisplayView(1); return; }
-  if (input == "v2") { selectDisplayView(2); return; }
-  if (input == "v3") { selectDisplayView(3); return; }
-  if (input == "help" || input == "?") { printHelpMenu(); return; }
-  if (input == "status" || input == "s") { printSystemStatusTable(); return; }
+  // Executive Emergency Shutdown
+  if (strcmp(line, "shutdown") == 0) {
+    currentRunMode = MODE_NORMAL; // Cancel ongoing test/demo
+    sendCommand(0, CMD_MASTER_SHUTDOWN);
+    Serial.println(F("[ALERT] MASTER SHUTDOWN DISPATCHED NETWORK-WIDE!"));
+    return;
+  }
 
   // E-STOP Command Shortcuts
-  if (input == "estop" || input == "e" || input == "e0") { sendCommand(0, CMD_EMERGENCY_STOP); return; }
-  if (input == "e1") { sendCommand(1, CMD_EMERGENCY_STOP); return; }
-  if (input == "e2") { sendCommand(2, CMD_EMERGENCY_STOP); return; }
-  if (input == "e3") { sendCommand(3, CMD_EMERGENCY_STOP); return; }
+  if (strcmp(line, "estop") == 0 || strcmp(line, "e") == 0 || strcmp(line, "e0") == 0) {
+    currentRunMode = MODE_NORMAL;
+    sendCommand(0, CMD_EMERGENCY_STOP);
+    return;
+  }
+  if (strcmp(line, "e1") == 0) { sendCommand(1, CMD_EMERGENCY_STOP); return; }
+  if (strcmp(line, "e2") == 0) { sendCommand(2, CMD_EMERGENCY_STOP); return; }
+  if (strcmp(line, "e3") == 0) { sendCommand(3, CMD_EMERGENCY_STOP); return; }
 
-  // Test & Power Shortcuts
-  if (input == "t1")   { handleTestCommand(1); return; }
-  if (input == "t2")   { handleTestCommand(2); return; }
-  if (input == "t3")   { handleTestCommand(3); return; }
-  if (input == "tall" || input == "t0") { handleTestCommand(0); return; }
-  if (input == "p1")   { sendCommand(1, CMD_POWER_SAVE); return; }
-  if (input == "p2")   { sendCommand(2, CMD_POWER_SAVE); return; }
-  if (input == "p3")   { sendCommand(3, CMD_POWER_SAVE); return; }
-  if (input == "pall" || input == "p0") { sendCommand(0, CMD_POWER_SAVE); return; }
-  if (input == "w0")   { sendCommand(0, CMD_WAKEUP); return; }
-  if (input == "w1")   { sendCommand(1, CMD_WAKEUP); return; }
-  if (input == "w2")   { sendCommand(2, CMD_WAKEUP); return; }
-  if (input == "w3")   { sendCommand(3, CMD_WAKEUP); return; }
+  // Power & Test Shortcuts
+  if (strcmp(line, "demo") == 0) { startDemoShowcase(); return; }
+  if (strcmp(line, "t1") == 0)   { startTestSequence(1); return; }
+  if (strcmp(line, "t2") == 0)   { startTestSequence(2); return; }
+  if (strcmp(line, "t3") == 0)   { startTestSequence(3); return; }
+  if (strcmp(line, "tall") == 0 || strcmp(line, "t0") == 0) { startTestSequence(0); return; }
+  if (strcmp(line, "p1") == 0)   { sendCommand(1, CMD_POWER_SAVE); return; }
+  if (strcmp(line, "p2") == 0)   { sendCommand(2, CMD_POWER_SAVE); return; }
+  if (strcmp(line, "p3") == 0)   { sendCommand(3, CMD_POWER_SAVE); return; }
+  if (strcmp(line, "pall") == 0 || strcmp(line, "p0") == 0) { sendCommand(0, CMD_POWER_SAVE); return; }
+  if (strcmp(line, "w0") == 0)   { sendCommand(0, CMD_WAKEUP); return; }
+  if (strcmp(line, "w1") == 0)   { sendCommand(1, CMD_WAKEUP); return; }
+  if (strcmp(line, "w2") == 0)   { sendCommand(2, CMD_WAKEUP); return; }
+  if (strcmp(line, "w3") == 0)   { sendCommand(3, CMD_WAKEUP); return; }
 
-  // Advanced Command Parser ("action target_id param extra")
-  int firstSpace = input.indexOf(' ');
-  String action = (firstSpace == -1) ? input : input.substring(0, firstSpace);
-  action.toLowerCase();
-  
-  String rest = (firstSpace != -1) ? input.substring(firstSpace + 1) : "";
-  int secondSpace = rest.indexOf(' ');
-  uint8_t targetId = (secondSpace == -1) ? rest.toInt() : rest.substring(0, secondSpace).toInt();
-  uint16_t param = (secondSpace != -1) ? rest.substring(secondSpace + 1).toInt() : 0;
+  // Parameterized Tokenizer ("command arg1 arg2")
+  char* command = strtok(line, " ");
+  char* arg1    = strtok(NULL, " ");
+  char* arg2    = strtok(NULL, " ");
 
-  if (action == "act")         sendCommand(targetId, CMD_ACTUATOR_CTRL, param);
-  else if (action == "cfg")    sendCommand(targetId, CMD_SET_CONFIG, param);
-  else if (action == "boot")   sendCommand(targetId, CMD_REBOOT);
+  if (!command) return;
+
+  if (strcmp(command, "speed") == 0 && arg1) {
+    uint16_t speedVal = constrain(atoi(arg1), 0, 100);
+    sendCommand(0, CMD_SET_FLEET_SPEED, speedVal);
+  }
+  else if (strcmp(command, "banner") == 0) {
+    // Reassemble full text string after "banner "
+    char* fullText = line + strlen("banner") + 1;
+    sendBroadcastBanner(fullText);
+  }
+  else if (strcmp(command, "act") == 0 && arg1 && arg2) {
+    sendCommand(atoi(arg1), CMD_ACTUATOR_CTRL, atoi(arg2));
+  }
+  else if (strcmp(command, "cfg") == 0 && arg1 && arg2) {
+    sendCommand(atoi(arg1), CMD_SET_CONFIG, atoi(arg2));
+  }
+  else if (strcmp(command, "boot") == 0 && arg1) {
+    sendCommand(atoi(arg1), CMD_REBOOT);
+  }
   else {
-    Serial.println(F("[CLI] Command unrecognized. Type 'help' or '?' for syntax."));
+    Serial.println(F("[CLI] Command unrecognized. Type 'help' or '?' for menu."));
+  }
+}
+
+void processSerialInput() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\r') continue; // Ignore carriage returns
+    if (c == '\n') {
+      cliInputBuffer[cliBufferIndex] = '\0'; // Null terminate
+      if (cliBufferIndex > 0) {
+        parseAndExecuteCLI(cliInputBuffer);
+      }
+      cliBufferIndex = 0; // Reset buffer
+    } else if (cliBufferIndex < sizeof(cliInputBuffer) - 1) {
+      cliInputBuffer[cliBufferIndex++] = c;
+    }
   }
 }
 
 // ==========================================
-// SETUP & MAIN LOOP
+// 6. SETUP & MAIN LOOP
 // ==========================================
 
 void setup() {
@@ -360,7 +482,7 @@ void setup() {
   delay(1200);
 
   WiFi.mode(WIFI_STA);
-  Serial.print(F("[SYSTEM] MCU 0 MAC Address: "));
+  Serial.print(F("[SYSTEM] MCU 0 STA MAC Address: "));
   Serial.println(WiFi.macAddress());
 
   if (esp_now_init() != ESP_OK) {
@@ -386,17 +508,18 @@ void setup() {
   lcd.clear();
   updateLcdDisplay();
   printHelpMenu();
-  Serial.println(F("[READY] MCU 0 Master Controller active."));
+  Serial.println(F("[READY] MCU 0 Master Orchestrator running."));
 }
 
 void loop() {
   updateStationHealth();
+  processSequenceEngine(); // Non-blocking state machine for tests/demos
 
   if (millis() - lastLcdRefresh >= LCD_REFRESH_INTERVAL) {
     lastLcdRefresh = millis();
     updateLcdDisplay();
   }
 
-  handleSerialCommands();
-  delay(10);
+  processSerialInput(); // Non-blocking C-string CLI parser
+  delay(5);
 }
