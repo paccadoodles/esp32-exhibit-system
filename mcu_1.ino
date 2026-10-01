@@ -1,8 +1,11 @@
-#include <Arduino.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-#include <esp_now.h>
-#include <WiFi.h>
+// ==========================================
+// MCU 1 - WIND TURBINE STATION FIRMWARE
+// ==========================================
+#include 
+#include 
+#include 
+#include 
+#include 
 #include "espnow_protocol.h"
 
 // ==========================================
@@ -33,8 +36,8 @@ const int resolution = 8;     // 8-bit resolution (0 - 255)
 
 // Timings & Cutoffs
 const unsigned long TRIGGER_DURATION_MS = 15000; // 15s wind burst duration
-const float PROXIMITY_THRESHOLD_CM = 25.0;      // Distance cutoff for car detection
-const int REQUIRED_CONSECUTIVE_READINGS = 3;    // Filter false triggers
+const float PROXIMITY_THRESHOLD_CM = 25.0;        // Distance cutoff for car detection
+const int REQUIRED_CONSECUTIVE_READINGS = 3;      // Filter false triggers
 
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
@@ -44,6 +47,9 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 StationTelemetryPayload myStationData;
 bool isSleeping = false;
 bool emergencyStop = false;
+bool masterShutdown = false;
+uint8_t fleetSpeedCap = 100;   // 0 - 100% executive global speed limit
+
 char currentMode = 'e';        // 'e' = Manual/Encoder, 's' = Proximity, 'x' = Off, '1'..'3' = Presets
 bool isTriggeredActive = false;
 unsigned long burstStartTime = 0;
@@ -59,8 +65,14 @@ const unsigned long debounceDelay = 50;
 unsigned long buttonPressStartTime = 0;
 bool buttonWasPressed = false;
 bool longPressTriggered = false;
+
+// Display Banner & Mode Change States
 unsigned long modeSwitchMessageTimer = 0;
 bool showingModeChangeMessage = false;
+
+char bannerMessage[21] = "";
+unsigned long bannerTimer = 0;
+bool showingBanner = false;
 
 unsigned long lastLcdUpdate = 0;
 const unsigned long lcdUpdateInterval = 250;
@@ -68,10 +80,16 @@ const unsigned long lcdUpdateInterval = 250;
 unsigned long lastTelemetryTx = 0;
 unsigned long telemetryInterval = 2000; // 2s active, 10s power-save
 
-// Thread-safe command queue flags (Populated in callback, processed in loop)
+// Thread-Safe Volatile Command Queue Flags
 volatile bool hasPendingCmd = false;
 volatile uint8_t pendingCmd = 0;
 volatile uint16_t pendingParam = 0;
+
+volatile bool hasPendingBanner = false;
+char pendingBannerText[21] = "";
+
+// Forward Declarations
+void runFunctionalityTest();
 
 // ==========================================
 // DISPLAY ENGINE (PADDED BUFFER)
@@ -90,6 +108,16 @@ void updateLCD(float distance) {
   if (millis() - lastLcdUpdate < lcdUpdateInterval) return;
   lastLcdUpdate = millis();
 
+  // 1. Master Shutdown State
+  if (masterShutdown) {
+    writeLcdLine(0, "=== STN 1: WIND ====");
+    writeLcdLine(1, " MODE: SHUTDOWN     ");
+    writeLcdLine(2, " FLEET HALTED       ");
+    writeLcdLine(3, "====================");
+    return;
+  }
+
+  // 2. Emergency Stop State
   if (emergencyStop) {
     writeLcdLine(0, "=== STN 1: WIND ====");
     writeLcdLine(1, " MODE: EMERGENCY    ");
@@ -98,6 +126,21 @@ void updateLCD(float distance) {
     return;
   }
 
+  // 3. Custom Broadcast Banner Overlay
+  if (showingBanner) {
+    if (millis() - bannerTimer < 3500) {
+      writeLcdLine(0, "=== MASTER ALERT ===");
+      writeLcdLine(1, bannerMessage);
+      writeLcdLine(2, "====================");
+      writeLcdLine(3, "                    ");
+      return;
+    } else {
+      showingBanner = false;
+      lcd.clear();
+    }
+  }
+
+  // 4. Mode Switch Message
   if (showingModeChangeMessage) {
     if (millis() - modeSwitchMessageTimer < 1500) {
       writeLcdLine(0, "====================");
@@ -113,11 +156,13 @@ void updateLCD(float distance) {
     }
   }
 
+  // 5. Standard Operating Displays
   char lineBuf[21];
   if (currentMode == 'e') {
     writeLcdLine(0, "=== WIND TURBINE ===");
-    writeLcdLine(1, "Mode: Manual/Encoder");
-    snprintf(lineBuf, sizeof(lineBuf), "Spd: %3d | %4.0f RPM", manualEncoderSpeed, myStationData.sensor_metric);
+    snprintf(lineBuf, sizeof(lineBuf), "Mode: Enc | Cap:%3d%%", fleetSpeedCap);
+    writeLcdLine(1, lineBuf);
+    snprintf(lineBuf, sizeof(lineBuf), "Spd: %3d | %4.0f RPM", currentFanSpeed, myStationData.sensor_metric);
     writeLcdLine(2, lineBuf);
     writeLcdLine(3, "Turn:Spd | Click:Off");
   } else if (currentMode == 's') {
@@ -145,19 +190,27 @@ void updateLCD(float distance) {
 // HARDWARE CONTROLS & SENSORS
 // ==========================================
 
-void setFanSpeed(int fanID, int speed) {
-  speed = constrain(speed, 0, 255);
-  if (speed > 0 && speed < 60) speed = 60; // Deadzone threshold
+void setFanSpeed(int fanID, int rawSpeed) {
+  int scaledSpeed = rawSpeed;
+
+  if (emergencyStop || isSleeping || masterShutdown) {
+    scaledSpeed = 0;
+  } else {
+    // Apply Executive Fleet Speed Cap (0 - 100%)
+    scaledSpeed = (rawSpeed * fleetSpeedCap) / 100;
+    if (scaledSpeed > 0 && scaledSpeed < 60) scaledSpeed = 60; // Deadzone threshold
+  }
+  scaledSpeed = constrain(scaledSpeed, 0, 255);
 
   if (fanID == 1) {
-    if (speed == 0) { ledcWrite(AIN1, 0); ledcWrite(AIN2, 0); }
-    else            { ledcWrite(AIN1, speed); ledcWrite(AIN2, 0); }
+    if (scaledSpeed == 0) { ledcWrite(AIN1, 0); ledcWrite(AIN2, 0); }
+    else                  { ledcWrite(AIN1, scaledSpeed); ledcWrite(AIN2, 0); }
   } else if (fanID == 2) {
-    if (speed == 0) { ledcWrite(BIN1, 0); ledcWrite(BIN2, 0); }
-    else            { ledcWrite(BIN1, speed); ledcWrite(BIN2, 0); }
+    if (scaledSpeed == 0) { ledcWrite(BIN1, 0); ledcWrite(BIN2, 0); }
+    else                  { ledcWrite(BIN1, scaledSpeed); ledcWrite(BIN2, 0); }
   }
 
-  currentFanSpeed = speed; // Update tracked speed
+  currentFanSpeed = scaledSpeed; // Track live scaled speed
 }
 
 float readUltrasonicDistance() {
@@ -194,6 +247,7 @@ void setPowerMode(bool enableSleep) {
     myStationData.status = 1; // Active Run
     telemetryInterval = 2000;
     emergencyStop = false;
+    masterShutdown = false;
     
     lcd.backlight();
     lcd.clear();
@@ -271,12 +325,16 @@ void sendTelemetry() {
   myStationData.station_id = 1;
   myStationData.actuator_state = (currentFanSpeed > 0);
   myStationData.voltage = isSleeping ? 11.2f : 12.5f;
-  myStationData.sensor_metric = (isSleeping || emergencyStop) ? 0.0f : (currentFanSpeed * 12.0f); // Simulated Wind RPM
+  myStationData.sensor_metric = (isSleeping || emergencyStop || masterShutdown) ? 0.0f : (currentFanSpeed * 12.0f); // Simulated Wind RPM
 
-  if (emergencyStop) {
+  if (masterShutdown) {
+    myStationData.status = CMD_MASTER_SHUTDOWN;
+  } else if (emergencyStop) {
     myStationData.status = CMD_EMERGENCY_STOP;
   } else if (isSleeping) {
     myStationData.status = CMD_POWER_SAVE;
+  } else {
+    myStationData.status = 1; // Active
   }
 
   esp_now_send(MCU0_MAC, (uint8_t *)&myStationData, sizeof(myStationData));
@@ -292,18 +350,27 @@ void sendAck(uint8_t cmdReceived, bool success) {
   esp_now_send(MCU0_MAC, (uint8_t *)&ack, sizeof(ack));
 }
 
-// Interruption-free lightweight receive handler
+// Thread-safe interrupt-free receive handler
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-  if (len != sizeof(ControllerCommandPayload)) return;
+  if (len == sizeof(ControllerCommandPayload)) {
+    ControllerCommandPayload cmdPayload;
+    memcpy(&cmdPayload, incomingData, sizeof(cmdPayload));
 
-  ControllerCommandPayload cmdPayload;
-  memcpy(&cmdPayload, incomingData, sizeof(cmdPayload));
+    if (cmdPayload.target_station_id != 0 && cmdPayload.target_station_id != 1) return;
 
-  if (cmdPayload.target_station_id != 0 && cmdPayload.target_station_id != 1) return;
+    pendingCmd = cmdPayload.command;
+    pendingParam = cmdPayload.parameter;
+    hasPendingCmd = true;
+  } 
+  else if (len == sizeof(CustomBannerPayload)) {
+    CustomBannerPayload bannerPayload;
+    memcpy(&bannerPayload, incomingData, sizeof(bannerPayload));
 
-  pendingCmd = cmdPayload.command;
-  pendingParam = cmdPayload.parameter;
-  hasPendingCmd = true;
+    if (bannerPayload.target_station_id != 0 && bannerPayload.target_station_id != 1) return;
+
+    snprintf(pendingBannerText, sizeof(pendingBannerText), "%-20s", bannerPayload.banner_text);
+    hasPendingBanner = true;
+  }
 }
 
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {}
@@ -313,13 +380,22 @@ void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {}
 // ==========================================
 
 void processPendingCommand() {
+  // Handle Banner Message
+  if (hasPendingBanner) {
+    hasPendingBanner = false;
+    snprintf(bannerMessage, sizeof(bannerMessage), "%s", pendingBannerText);
+    showingBanner = true;
+    bannerTimer = millis();
+  }
+
+  // Handle Command Packets
   if (!hasPendingCmd) return;
 
   uint8_t cmd = pendingCmd;
   uint16_t param = pendingParam;
   hasPendingCmd = false;
 
-  Serial.printf("[CMD RX] Executing Command ID: %d (Param: %d)\n", cmd, param);
+  Serial.printf("[CMD RX] Executing Command ID: 0x%02X (Param: %d)\n", cmd, param);
 
   switch (cmd) {
     case CMD_RUN_TEST:
@@ -341,9 +417,22 @@ void processPendingCommand() {
       emergencyStop = true;
       setFanSpeed(1, 0);
       setFanSpeed(2, 0);
-      myStationData.status = CMD_EMERGENCY_STOP;
       sendAck(cmd, true);
       Serial.println(F("[ALERT] EMERGENCY STOP ACTIVATED! Wind Turbine Halted."));
+      break;
+
+    case CMD_MASTER_SHUTDOWN:
+      masterShutdown = true;
+      setFanSpeed(1, 0);
+      setFanSpeed(2, 0);
+      sendAck(cmd, true);
+      Serial.println(F("[ALERT] MASTER SHUTDOWN DISPATCHED! All local systems locked."));
+      break;
+
+    case CMD_SET_FLEET_SPEED:
+      fleetSpeedCap = constrain((uint8_t)param, 0, 100);
+      sendAck(cmd, true);
+      Serial.printf("[SPEED] Fleet speed scaling cap set to %d%%\n", fleetSpeedCap);
       break;
 
     case CMD_ACTUATOR_CTRL:
@@ -356,14 +445,14 @@ void processPendingCommand() {
         setFanSpeed(2, 0);
       }
       sendAck(cmd, true);
-      Serial.printf("[ACTUATOR] Wind Turbine speed set via remote: %d\n", manualEncoderSpeed);
+      Serial.printf("[ACTUATOR] Wind speed target set via remote: %d\n", manualEncoderSpeed);
       break;
 
     case CMD_SET_CONFIG:
       if (param >= 500 && param <= 30000) {
         telemetryInterval = param;
         sendAck(cmd, true);
-        Serial.printf("[CFG] Telemetry interval set to %d ms\n", param);
+        Serial.printf("[CFG] Telemetry report interval set to %d ms\n", param);
       } else {
         sendAck(cmd, false);
       }
@@ -485,7 +574,7 @@ void setup() {
 }
 
 void loop() {
-  // 1. Execute queued commands on main thread (Prevents Watchdog Reboots)
+  // 1. Execute queued commands on main thread
   processPendingCommand();
 
   // 2. Hardware UI Controls
@@ -504,12 +593,8 @@ void loop() {
     myStationData.car_status = 0;   
   }
 
-  // 4. State Machine Drive Motors
-  if (isSleeping || emergencyStop) {
-    setFanSpeed(1, 0);
-    setFanSpeed(2, 0);
-  } 
-  else if (currentMode == 's') {
+  // 4. Drive Motors
+  if (currentMode == 's') {
     if (isTriggeredActive) {
       if (millis() - burstStartTime < TRIGGER_DURATION_MS) {
         setFanSpeed(1, 255); setFanSpeed(2, 255);
