@@ -1,8 +1,11 @@
-#include <Arduino.h>
-#include <esp_now.h>
-#include <WiFi.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+// ==========================================
+// MCU 2 - SOLAR FARM STATION FIRMWARE
+// ==========================================
+#include 
+#include 
+#include 
+#include 
+#include 
 #include "espnow_protocol.h"
 
 // ==========================================
@@ -19,17 +22,27 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 StationTelemetryPayload myStationData;
 bool isSleeping = false;
 bool emergencyStop = false;
-bool actuatorState = false; // E.g., Solar Tracker Motor / Power Relay
+bool masterShutdown = false;
+uint8_t fleetSpeedCap = 100;   // 0 - 100% capacity scaling cap
+bool actuatorState = false;   // Solar Tracker Motor / Power Relay
 uint8_t currentDisplayPage = 0;
 
 unsigned long lastTelemetryTx = 0;
 unsigned long telemetryInterval = 2000; // 2s active, 10s power-save
 unsigned long lastLcdUpdate = 0;
 
+// Display Banner States
+char bannerMessage[21] = "";
+unsigned long bannerTimer = 0;
+bool showingBanner = false;
+
 // Thread-safe command queue flags (Populated in callback, processed in loop)
 volatile bool hasPendingCmd = false;
 volatile uint8_t pendingCmd = 0;
 volatile uint16_t pendingParam = 0;
+
+volatile bool hasPendingBanner = false;
+char pendingBannerText[21] = "";
 
 // Clean Energy Solar Facts Database
 const char* SOLAR_FACTS[] = {
@@ -39,6 +52,9 @@ const char* SOLAR_FACTS[] = {
   "Photovoltaic Clean Pwr"
 };
 const uint8_t TOTAL_FACTS = 4;
+
+// Forward Declarations
+void runFunctionalityTest();
 
 // ==========================================
 // MODULAR LCD BUFFER ENGINE
@@ -56,6 +72,16 @@ void renderSolarFarmDisplay() {
 
   char buf[21];
 
+  // 1. Master Shutdown State
+  if (masterShutdown) {
+    writeLcdLine(0, "=== STN 2: SOLAR ===");
+    writeLcdLine(1, " MODE: SHUTDOWN     ");
+    writeLcdLine(2, " FLEET HALTED       ");
+    writeLcdLine(3, "====================");
+    return;
+  }
+
+  // 2. Emergency Stop State
   if (emergencyStop) {
     writeLcdLine(0, "=== STN 2: SOLAR ===");
     writeLcdLine(1, " MODE: EMERGENCY    ");
@@ -64,6 +90,21 @@ void renderSolarFarmDisplay() {
     return;
   }
 
+  // 3. Custom Broadcast Banner Overlay
+  if (showingBanner) {
+    if (millis() - bannerTimer < 3500) {
+      writeLcdLine(0, "=== MASTER ALERT ===");
+      writeLcdLine(1, bannerMessage);
+      writeLcdLine(2, "====================");
+      writeLcdLine(3, "                    ");
+      return;
+    } else {
+      showingBanner = false;
+      lcd.clear();
+    }
+  }
+
+  // 4. Standard Operational Display
   // Line 0: Header
   writeLcdLine(0, "STN 2: SOLAR FARM   ");
 
@@ -77,8 +118,9 @@ void renderSolarFarmDisplay() {
            actuatorState ? "ON" : "OFF");
   writeLcdLine(2, buf);
 
-  // Line 3: Power Metrics & Page ID
-  snprintf(buf, sizeof(buf), "%4.1fW | PAGE:%d     ", myStationData.sensor_metric, currentDisplayPage);
+  // Line 3: Power Metrics & Capacity Cap
+  float currentWatts = (isSleeping || emergencyStop || masterShutdown) ? 0.0f : (48.5f * fleetSpeedCap / 100.0f);
+  snprintf(buf, sizeof(buf), "%4.1fW | CAP:%3d%%   ", currentWatts, fleetSpeedCap);
   writeLcdLine(3, buf);
 }
 
@@ -103,6 +145,7 @@ void setPowerMode(bool enableSleep) {
   if (isSleeping) {
     myStationData.status = CMD_POWER_SAVE;
     telemetryInterval = 10000;
+    actuatorState = false;
     
     lcd.noBacklight();
     writeLcdLine(0, "--------------------");
@@ -114,8 +157,10 @@ void setPowerMode(bool enableSleep) {
     myStationData.status = 1; // Active Run
     telemetryInterval = 2000;
     emergencyStop = false;
+    masterShutdown = false;
     
     lcd.backlight();
+    lcd.clear();
     renderSolarFarmDisplay();
     Serial.println(F("[POWER] Restored Active Operational Mode."));
   }
@@ -126,17 +171,20 @@ void setPowerMode(bool enableSleep) {
 // ==========================================
 
 void sendTelemetry() {
-  // Update live station state
   myStationData.packet_type = PKT_TELEMETRY;
   myStationData.station_id = 2;
   myStationData.actuator_state = actuatorState;
-  myStationData.voltage = isSleeping ? 11.8f : 12.6f; // Simulated system voltage
-  myStationData.sensor_metric = isSleeping ? 0.0f : 48.5f; // Solar Output in Watts
+  myStationData.voltage = isSleeping ? 11.8f : 12.6f;
+  myStationData.sensor_metric = (isSleeping || emergencyStop || masterShutdown) ? 0.0f : (48.5f * fleetSpeedCap / 100.0f);
 
-  if (emergencyStop) {
+  if (masterShutdown) {
+    myStationData.status = CMD_MASTER_SHUTDOWN;
+  } else if (emergencyStop) {
     myStationData.status = CMD_EMERGENCY_STOP;
   } else if (isSleeping) {
     myStationData.status = CMD_POWER_SAVE;
+  } else {
+    myStationData.status = 1; // Active
   }
 
   esp_now_send(MCU0_MAC, (uint8_t *)&myStationData, sizeof(myStationData));
@@ -152,19 +200,27 @@ void sendAck(uint8_t cmdReceived, bool success) {
   esp_now_send(MCU0_MAC, (uint8_t *)&ack, sizeof(ack));
 }
 
-// Interruption-free lightweight callback handler
+// Thread-safe interrupt-free receive handler
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-  if (len != sizeof(ControllerCommandPayload)) return;
+  if (len == sizeof(ControllerCommandPayload)) {
+    ControllerCommandPayload cmd;
+    memcpy(&cmd, incomingData, sizeof(cmd));
 
-  ControllerCommandPayload cmd;
-  memcpy(&cmd, incomingData, sizeof(cmd));
+    if (cmd.target_station_id != 0 && cmd.target_station_id != 2) return;
 
-  if (cmd.target_station_id != 0 && cmd.target_station_id != 2) return;
+    pendingCmd = cmd.command;
+    pendingParam = cmd.parameter;
+    hasPendingCmd = true;
+  } 
+  else if (len == sizeof(CustomBannerPayload)) {
+    CustomBannerPayload bannerPayload;
+    memcpy(&bannerPayload, incomingData, sizeof(bannerPayload));
 
-  // Queue values for loop execution
-  pendingCmd = cmd.command;
-  pendingParam = cmd.parameter;
-  hasPendingCmd = true;
+    if (bannerPayload.target_station_id != 0 && bannerPayload.target_station_id != 2) return;
+
+    snprintf(pendingBannerText, sizeof(pendingBannerText), "%-20s", bannerPayload.banner_text);
+    hasPendingBanner = true;
+  }
 }
 
 // ==========================================
@@ -172,13 +228,22 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
 // ==========================================
 
 void processPendingCommand() {
+  // 1. Process Banner Display Overlays
+  if (hasPendingBanner) {
+    hasPendingBanner = false;
+    snprintf(bannerMessage, sizeof(bannerMessage), "%s", pendingBannerText);
+    showingBanner = true;
+    bannerTimer = millis();
+  }
+
+  // 2. Process Command Packets
   if (!hasPendingCmd) return;
 
   uint8_t cmd = pendingCmd;
   uint16_t param = pendingParam;
-  hasPendingCmd = false; // Clear queue flag
+  hasPendingCmd = false;
 
-  Serial.printf("[CMD RX] Executing Command ID: %d (Param: %d)\n", cmd, param);
+  Serial.printf("[CMD RX] Executing Command ID: 0x%02X (Param: %d)\n", cmd, param);
 
   switch (cmd) {
     case CMD_RUN_TEST:
@@ -203,6 +268,22 @@ void processPendingCommand() {
       renderSolarFarmDisplay();
       sendAck(cmd, true);
       Serial.println(F("[ALERT] EMERGENCY STOP ACTIVATED!"));
+      break;
+
+    case CMD_MASTER_SHUTDOWN:
+      masterShutdown = true;
+      actuatorState = false;
+      myStationData.status = CMD_MASTER_SHUTDOWN;
+      renderSolarFarmDisplay();
+      sendAck(cmd, true);
+      Serial.println(F("[ALERT] MASTER SHUTDOWN ACTIVATED! Solar tracker halted."));
+      break;
+
+    case CMD_SET_FLEET_SPEED:
+      fleetSpeedCap = constrain((uint8_t)param, 0, 100);
+      renderSolarFarmDisplay();
+      sendAck(cmd, true);
+      Serial.printf("[SPEED] Fleet solar output capacity cap set to %d%%\n", fleetSpeedCap);
       break;
 
     case CMD_ACTUATOR_CTRL:
@@ -240,7 +321,7 @@ void processPendingCommand() {
 // ==========================================
 
 void runFunctionalityTest() {
-  Serial.println(F("[TEST] Starting Noticeable 6-Sec Solar Farm Diagnostic..."));
+  Serial.println(F("[TEST] Starting Noticeable Solar Farm Diagnostic..."));
   myStationData.status = CMD_RUN_TEST;
   sendTelemetry();
 
@@ -319,7 +400,7 @@ void setup() {
   peerInfo.encrypt = false;
   esp_now_add_peer(&peerInfo);
 
-  Serial.println(F("[READY] MCU 2 (Solar Farm) initialized."));
+  Serial.println(F("[READY] MCU 2 (Solar Farm) active."));
 }
 
 void loop() {
@@ -330,7 +411,7 @@ void loop() {
   float distance = readUltrasonicDistance();
   myStationData.car_status = (distance > 0 && distance <= 25.0) ? 1 : 0;
 
-  // 3. Render Screen Updates (if active)
+  // 3. Render Screen Updates
   if (!isSleeping && (millis() - lastLcdUpdate >= 500)) {
     lastLcdUpdate = millis();
     renderSolarFarmDisplay();
