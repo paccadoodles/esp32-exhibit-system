@@ -1,8 +1,11 @@
-#include <Arduino.h>
-#include <esp_now.h>
-#include <WiFi.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+// ==========================================
+// MCU 3 - HYDRO POWER STATION FIRMWARE
+// ==========================================
+#include 
+#include 
+#include 
+#include 
+#include 
 #include "espnow_protocol.h"
 
 // ==========================================
@@ -19,17 +22,27 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 StationTelemetryPayload myStationData;
 bool isSleeping = false;
 bool emergencyStop = false;
-bool actuatorState = false; // Hydro Water Valve / Pump Control State
+bool masterShutdown = false;
+uint8_t fleetSpeedCap = 100;   // 0 - 100% intake flow capacity cap
+bool actuatorState = false;   // Hydro Water Valve / Pump Control State
 uint8_t currentDisplayPage = 0;
 
 unsigned long lastTelemetryTx = 0;
 unsigned long telemetryInterval = 2000; // 2s active, 10s power-save
 unsigned long lastLcdUpdate = 0;
 
+// Display Banner States
+char bannerMessage[21] = "";
+unsigned long bannerTimer = 0;
+bool showingBanner = false;
+
 // Thread-safe command queue flags (Populated in callback, processed in loop)
 volatile bool hasPendingCmd = false;
 volatile uint8_t pendingCmd = 0;
 volatile uint16_t pendingParam = 0;
+
+volatile bool hasPendingBanner = false;
+char pendingBannerText[21] = "";
 
 // Clean Energy Hydro Facts Database
 const char* HYDRO_FACTS[] = {
@@ -39,6 +52,9 @@ const char* HYDRO_FACTS[] = {
   "80% Efficiency Rate "
 };
 const uint8_t TOTAL_FACTS = 4;
+
+// Forward Declarations
+void runFunctionalityTest();
 
 // ==========================================
 // MODULAR LCD BUFFER ENGINE
@@ -56,6 +72,16 @@ void renderHydroStationDisplay() {
 
   char buf[21];
 
+  // 1. Master Shutdown State
+  if (masterShutdown) {
+    writeLcdLine(0, "=== STN 3: HYDRO ===");
+    writeLcdLine(1, " MODE: SHUTDOWN     ");
+    writeLcdLine(2, " FLEET HALTED       ");
+    writeLcdLine(3, "====================");
+    return;
+  }
+
+  // 2. Emergency Stop State
   if (emergencyStop) {
     writeLcdLine(0, "=== STN 3: HYDRO ===");
     writeLcdLine(1, " MODE: EMERGENCY    ");
@@ -64,6 +90,21 @@ void renderHydroStationDisplay() {
     return;
   }
 
+  // 3. Custom Broadcast Banner Overlay
+  if (showingBanner) {
+    if (millis() - bannerTimer < 3500) {
+      writeLcdLine(0, "=== MASTER ALERT ===");
+      writeLcdLine(1, bannerMessage);
+      writeLcdLine(2, "====================");
+      writeLcdLine(3, "                    ");
+      return;
+    } else {
+      showingBanner = false;
+      lcd.clear();
+    }
+  }
+
+  // 4. Standard Operational Display
   // Line 0: Header
   writeLcdLine(0, "STN 3: HYDRO POWER  ");
 
@@ -77,8 +118,9 @@ void renderHydroStationDisplay() {
            actuatorState ? "OPEN" : "CLSD");
   writeLcdLine(2, buf);
 
-  // Line 3: Flow Metric & Page ID
-  snprintf(buf, sizeof(buf), "%4.1fL/m| PAGE:%d    ", myStationData.sensor_metric, currentDisplayPage);
+  // Line 3: Flow Metric & Capacity Cap
+  float currentFlow = (isSleeping || emergencyStop || masterShutdown) ? 0.0f : (24.5f * fleetSpeedCap / 100.0f);
+  snprintf(buf, sizeof(buf), "%4.1fL/m| CAP:%3d%%  ", currentFlow, fleetSpeedCap);
   writeLcdLine(3, buf);
 }
 
@@ -103,6 +145,7 @@ void setPowerMode(bool enableSleep) {
   if (isSleeping) {
     myStationData.status = CMD_POWER_SAVE;
     telemetryInterval = 10000;
+    actuatorState = false; // Close valve in power save
     
     lcd.noBacklight();
     writeLcdLine(0, "--------------------");
@@ -114,8 +157,10 @@ void setPowerMode(bool enableSleep) {
     myStationData.status = 1; // Active Run
     telemetryInterval = 2000;
     emergencyStop = false;
+    masterShutdown = false;
     
     lcd.backlight();
+    lcd.clear();
     renderHydroStationDisplay();
     Serial.println(F("[POWER] Restored Active Operational Mode."));
   }
@@ -129,13 +174,17 @@ void sendTelemetry() {
   myStationData.packet_type = PKT_TELEMETRY;
   myStationData.station_id = 3;
   myStationData.actuator_state = actuatorState;
-  myStationData.voltage = isSleeping ? 11.5f : 12.4f; // Simulated operational voltage
-  myStationData.sensor_metric = (isSleeping || emergencyStop) ? 0.0f : 24.5f; // Water flow in L/m
+  myStationData.voltage = isSleeping ? 11.5f : 12.4f;
+  myStationData.sensor_metric = (isSleeping || emergencyStop || masterShutdown) ? 0.0f : (24.5f * fleetSpeedCap / 100.0f);
 
-  if (emergencyStop) {
+  if (masterShutdown) {
+    myStationData.status = CMD_MASTER_SHUTDOWN;
+  } else if (emergencyStop) {
     myStationData.status = CMD_EMERGENCY_STOP;
   } else if (isSleeping) {
     myStationData.status = CMD_POWER_SAVE;
+  } else {
+    myStationData.status = 1; // Active
   }
 
   esp_now_send(MCU0_MAC, (uint8_t *)&myStationData, sizeof(myStationData));
@@ -151,19 +200,27 @@ void sendAck(uint8_t cmdReceived, bool success) {
   esp_now_send(MCU0_MAC, (uint8_t *)&ack, sizeof(ack));
 }
 
-// Lightweight interrupt callback (no blocking delays or I2C calls)
+// Thread-safe interrupt-free receive handler
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-  if (len != sizeof(ControllerCommandPayload)) return;
+  if (len == sizeof(ControllerCommandPayload)) {
+    ControllerCommandPayload cmd;
+    memcpy(&cmd, incomingData, sizeof(cmd));
 
-  ControllerCommandPayload cmd;
-  memcpy(&cmd, incomingData, sizeof(cmd));
+    if (cmd.target_station_id != 0 && cmd.target_station_id != 3) return;
 
-  if (cmd.target_station_id != 0 && cmd.target_station_id != 3) return;
+    pendingCmd = cmd.command;
+    pendingParam = cmd.parameter;
+    hasPendingCmd = true;
+  } 
+  else if (len == sizeof(CustomBannerPayload)) {
+    CustomBannerPayload bannerPayload;
+    memcpy(&bannerPayload, incomingData, sizeof(bannerPayload));
 
-  // Queue parameters for loop processing
-  pendingCmd = cmd.command;
-  pendingParam = cmd.parameter;
-  hasPendingCmd = true;
+    if (bannerPayload.target_station_id != 0 && bannerPayload.target_station_id != 3) return;
+
+    snprintf(pendingBannerText, sizeof(pendingBannerText), "%-20s", bannerPayload.banner_text);
+    hasPendingBanner = true;
+  }
 }
 
 // ==========================================
@@ -171,13 +228,22 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
 // ==========================================
 
 void processPendingCommand() {
+  // 1. Process Banner Display Overlays
+  if (hasPendingBanner) {
+    hasPendingBanner = false;
+    snprintf(bannerMessage, sizeof(bannerMessage), "%s", pendingBannerText);
+    showingBanner = true;
+    bannerTimer = millis();
+  }
+
+  // 2. Process Command Packets
   if (!hasPendingCmd) return;
 
   uint8_t cmd = pendingCmd;
   uint16_t param = pendingParam;
   hasPendingCmd = false;
 
-  Serial.printf("[CMD RX] Executing Command ID: %d (Param: %d)\n", cmd, param);
+  Serial.printf("[CMD RX] Executing Command ID: 0x%02X (Param: %d)\n", cmd, param);
 
   switch (cmd) {
     case CMD_RUN_TEST:
@@ -202,6 +268,22 @@ void processPendingCommand() {
       renderHydroStationDisplay();
       sendAck(cmd, true);
       Serial.println(F("[ALERT] EMERGENCY STOP ACTIVATED! Hydro flow cut off."));
+      break;
+
+    case CMD_MASTER_SHUTDOWN:
+      masterShutdown = true;
+      actuatorState = false; // Immediately shut valve
+      myStationData.status = CMD_MASTER_SHUTDOWN;
+      renderHydroStationDisplay();
+      sendAck(cmd, true);
+      Serial.println(F("[ALERT] MASTER SHUTDOWN ACTIVATED! Hydro intake halted."));
+      break;
+
+    case CMD_SET_FLEET_SPEED:
+      fleetSpeedCap = constrain((uint8_t)param, 0, 100);
+      renderHydroStationDisplay();
+      sendAck(cmd, true);
+      Serial.printf("[SPEED] Fleet hydro intake capacity cap set to %d%%\n", fleetSpeedCap);
       break;
 
     case CMD_ACTUATOR_CTRL:
@@ -324,7 +406,7 @@ void setup() {
     Serial.println(F("[WARN] Failed to register MCU 0 peer!"));
   }
 
-  Serial.println(F("[READY] MCU 3 (Hydro Station) initialized successfully."));
+  Serial.println(F("[READY] MCU 3 (Hydro Station) active."));
 }
 
 void loop() {
