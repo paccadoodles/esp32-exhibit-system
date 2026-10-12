@@ -1,11 +1,11 @@
 // ==========================================
 // MCU 2 - SOLAR FARM STATION FIRMWARE
 // ==========================================
-#include 
-#include 
-#include 
-#include 
-#include 
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include "espnow_protocol.h"
 
 // ==========================================
