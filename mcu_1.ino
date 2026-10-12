@@ -1,11 +1,12 @@
 // ==========================================
 // MCU 1 - WIND TURBINE STATION FIRMWARE
 // ==========================================
-#include 
-#include 
-#include 
-#include 
-#include 
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <esp_wifi.h>
+#include <LiquidCrystal_I2C.h>
 #include "espnow_protocol.h"
 
 // ==========================================
@@ -547,8 +548,15 @@ void setup() {
   delay(500);
   lcd.clear();
 
-  // 3. Wi-Fi & ESP-NOW
+// 3. Wi-Fi & ESP-NOW
   WiFi.mode(WIFI_STA);
+  
+  // Manually force the MAC address to match what MCU 0 is expecting
+  uint8_t forced_mac[] = {0x70, 0x4B, 0xCA, 0x90, 0x4B, 0x80};
+  esp_wifi_set_mac(WIFI_IF_STA, forced_mac);
+  
+  delay(100); 
+
   Serial.print(F("[INFO] Station 1 MAC: "));
   Serial.println(WiFi.macAddress());
 
@@ -557,7 +565,7 @@ void setup() {
     myStationData.status = 0;
     return;
   }
-
+  
   esp_now_register_recv_cb(OnDataRecv);
   esp_now_register_send_cb(OnDataSent);
 
